@@ -54,7 +54,6 @@ class FargateSpawnerAuthentication(Configurable):
 
 
 class FargateSpawnerSecretAccessKeyAuthentication(FargateSpawnerAuthentication):
-
     aws_access_key_id = Unicode(config=True)
     aws_secret_access_key = Unicode(config=True)
     pre_auth_headers = Dict()
@@ -67,18 +66,24 @@ class FargateSpawnerSecretAccessKeyAuthentication(FargateSpawnerAuthentication):
         )
 
 
-class FargateSpawnerECSRoleAuthentication(FargateSpawnerAuthentication):
-
+class FargateSpawnerRoleAuthentication(FargateSpawnerAuthentication):
     aws_access_key_id = Unicode()
     aws_secret_access_key = Unicode()
     pre_auth_headers = Dict()
     expiration = Datetime()
+    auth_type = Unicode(config=True)
+    role_name = Unicode(config=True)
 
     async def get_credentials(self):
         now = datetime.datetime.now()
 
         if now > self.expiration:
-            request = HTTPRequest('http://169.254.170.2' + os.environ['AWS_CONTAINER_CREDENTIALS_RELATIVE_URI'], method='GET')
+            if self.auth_type != "ECS" and self.auth_type != "EC2":
+                raise ValueError("auth_type must be either 'ECS' or 'EC2'")
+            url = 'http://169.254.170.2' + os.environ[
+                'AWS_CONTAINER_CREDENTIALS_RELATIVE_URI'] if self.auth_type == "ECS" \
+                else "http://169.254.169.254/latest/meta-data/iam/security-credentials/" + self.role_name
+            request = HTTPRequest(url, method='GET')
             creds = json.loads((await AsyncHTTPClient().fetch(request)).body.decode('utf-8'))
             self.aws_access_key_id = creds['AccessKeyId']
             self.aws_secret_access_key = creds['SecretAccessKey']
@@ -95,7 +100,6 @@ class FargateSpawnerECSRoleAuthentication(FargateSpawnerAuthentication):
 
 
 class FargateSpawner(Spawner):
-
     aws_region = Unicode(config=True)
     aws_ecs_host = Unicode(config=True)
     task_role_arn = Unicode(config=True)
@@ -150,9 +154,10 @@ class FargateSpawner(Spawner):
 
         return \
             None if self.calling_run_task else \
-            0 if self.task_arn == '' else \
-            None if (await _get_task_status(self.log, self._aws_endpoint(), self.task_cluster_name, self.task_arn)) in ALLOWED_STATUSES else \
-            1
+                0 if self.task_arn == '' else \
+                    None if (await _get_task_status(self.log, self._aws_endpoint(), self.task_cluster_name,
+                                                    self.task_arn)) in ALLOWED_STATUSES else \
+                        1
 
     async def start(self):
         self.log.debug('Starting spawner')
@@ -235,7 +240,7 @@ class FargateSpawner(Spawner):
         return {
             'region': self.aws_region,
             'ecs_host': self.aws_ecs_host,
-            'ecs_auth': self.authentication.get_credentials,
+            'ecs_auth': self.authentication.get_credentials(),
         }
 
 
@@ -282,8 +287,8 @@ async def _describe_task(logger, aws_endpoint, task_cluster_name, task_arn):
     # not be present at all
     task = \
         described_tasks['tasks'][0] if 'tasks' in described_tasks and described_tasks['tasks'] else \
-        described_tasks['task'] if 'task' in described_tasks else \
-        None
+            described_tasks['task'] if 'task' in described_tasks else \
+                None
     return task
 
 
@@ -322,7 +327,7 @@ async def _run_task(logger, aws_endpoint,
 async def _make_ecs_request(logger, aws_endpoint, target, dict_data):
     service = 'ecs'
     body = json.dumps(dict_data).encode('utf-8')
-    credentials = await aws_endpoint['ecs_auth']()
+    credentials = await aws_endpoint['ecs_auth']
     pre_auth_headers = {
         'X-Amz-Target': f'AmazonEC2ContainerServiceV20141113.{target}',
         'Content-Type': 'application/x-amz-json-1.1',
@@ -405,8 +410,8 @@ def _aws_headers(service, access_key_id, secret_access_key,
         'x-amz-date': amzdate,
         'x-amz-content-sha256': payload_hash,
         'Authorization': (
-            f'{algorithm} Credential={access_key_id}/{credential_scope}, ' +
-            f'SignedHeaders={signed_headers}, Signature=' + signature()
+                f'{algorithm} Credential={access_key_id}/{credential_scope}, ' +
+                f'SignedHeaders={signed_headers}, Signature=' + signature()
         ),
     }
 
